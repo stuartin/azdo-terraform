@@ -1,0 +1,6 @@
+debug: true
+exit-code: 1
+
+scan:
+  skip-files:
+    - package.json
