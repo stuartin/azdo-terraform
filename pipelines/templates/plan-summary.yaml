@@ -1,0 +1,160 @@
+# Single Step:
+# There is an Azure DevOps limitation of only being able
+# to pass variables <= 32766 characters long
+# This makes it hard to pass large plan summaries between
+# steps, hence everything is in a single step
+
+parameters:
+  - name: environments
+    type: object
+    displayName: |
+      (Required) A list of environments to check
+
+      - name:       <string>   - (Required) The name of the environment. Usually dv, sy, st, pr, mg.
+        hasChanges: <string>   - (Required) Whether the environment has changes to apply
+        runUrl:     <string>   - (Required) The Terraform Cloud run url
+        token:      <string>   - (Required) A Terraform Cloud token to use when getting the run details
+
+jobs:
+  - job: PlanSummaryJob
+    displayName: Plan Summary
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+      - checkout: none
+      - pwsh: |
+          $tempDir = '$(Agent.TempDirectory)'
+          $tfSummarizeRelease = "0.3.13" # 2024-10-24
+          Set-Location -Path $tempDir
+
+          $environments = ConvertFrom-Json -InputObject '${{ convertToJson(parameters.environments) }}'
+
+          # Get environments that have changes
+          $environmentsWithChanges = $environments | Where-Object { $_.hasChanges -eq 'true' }
+
+          if ($environmentsWithChanges.length -eq 0) {
+            Write-Host "No changes detected"
+            exit 0
+          }
+
+          # Setup our markdown
+          $pipelineUrl = "$($env:SYSTEM_TEAMFOUNDATIONCOLLECTIONURI)$($env:SYSTEM_TEAMPROJECTID)/_build/results?buildId=$($env:BUILD_BUILDID)"
+          $lastUpdate = $([TimeZoneInfo]::ConvertTimeBySystemTimeZoneId((Get-Date -AsUTC), 'Pacific Standard Time'))
+          $commentLines = @(
+            "[//]: <> (terraform-plan-summary-comment: $($env:SYSTEM_DEFINITIONNAME))"
+            "<h1>🤖 Terraform Bot - $($env:SYSTEM_DEFINITIONNAME)</h1>",
+            "<sub>This comment will automatically be updated whenever the pipeline runs</sub>",
+            "<br/>",
+            "<sub>Only environments with changes will be shown</sub>",
+            "<br/><br/>",
+            "",
+            "<b>Pipeline:</b> [$($env:SYSTEM_DEFINITIONNAME)]($pipelineUrl)"
+            "<b>Last update (PST):</b> $lastUpdate",
+            ""
+            "<h2>Planned Changes</h2>",
+            "",
+            "Please validate that the below changes are expected before approving",
+            ""
+          )
+
+          # Generate markdown summary of changes per environment
+          $environmentsWithChanges | ForEach-Object {
+            $name = $_.name
+            $runUrl = $_.runUrl
+            $token = $_.token
+            $planFileName = "$($name)_plan.json"
+            $isSummaryOpen = $_.name -eq $environmentsWithChanges[0].name # The first summary should be open
+
+            # Make sure we have tf-summarize available
+            dpkg-query -l tf-summarize | Out-Null
+            if($LastExitCode -ne 0) {
+                Write-Host "Download tf-summarize"
+
+                $tfSummarizeReleaseUrl = "https://github.com/dineshba/tf-summarize/releases/download/v$($tfSummarizeRelease)/tf-summarize_$($tfSummarizeRelease)_linux_amd64.deb"
+                Invoke-RestMethod -Method GET -Uri $tfSummarizeReleaseUrl -OutFile "tf-summarize_linux_amd64.deb"
+                sudo apt-get install "./tf-summarize_linux_amd64.deb" | Out-Null
+            }
+            
+            Write-Host "Download $planFileName for $name"
+            $runId = $runUrl.split("/")[-1]
+            $headers = @{
+                Authorization  = "Bearer $token"
+                'Content-Type' = "application/vnd.api+json"
+            }
+
+            # Get the plan json file
+            $planJSONEndpoint = "https://app.terraform.io/api/v2/runs/$($runId)/plan/json-output"
+            Invoke-RestMethod -Headers $headers -Method GET -Uri $planJSONEndpoint -OutFile $planFileName
+
+            Write-Host "Generate summary for $name"
+            $tfSummarizeOutput = tf-summarize -md $planFileName
+
+            $commentLines += if($isSummaryOpen) { '<details open>' } else { '<details>' }
+            $commentLines += "  <summary><b>$name</b></summary>"
+            $commentLines += "  <br/>"
+            $commentLines += ""
+            $commentLines += "  <b>Run: </b>$runUrl"
+            $commentLines += "  <br/>"
+            $commentLines += ""
+            $tfSummarizeOutput | ForEach-Object { $commentLines += "  $_" }
+            $commentLines += "</details>"
+            $commentLines += "<br/>"
+
+            Write-Host ""
+          }
+
+          Write-Host "Update Pull Request"
+          $comment = $commentLines -join "`n"
+          $content = @"
+          $comment
+          "@
+
+          # Setup our URL and headers
+          $orgUrl = $env:SYSTEM_TEAMFOUNDATIONCOLLECTIONURI
+          $project = $env:SYSTEM_TEAMPROJECTID
+          $repo = $env:BUILD_REPOSITORY_NAME
+          $pr = $env:SYSTEM_PULLREQUEST_PULLREQUESTID
+          $token = $env:SYSTEM_ACCESS_TOKEN
+          $apiVersion = "?api-version=7.1"
+
+          $headers = @{
+              Authorization = "Bearer $env:SYSTEM_ACCESS_TOKEN"
+              "Content-Type" = "application/json"
+          }
+          $baseUrl = "$($orgUrl)$($project)/_apis/git/repositories/$($repo)/pullRequests/$($pr)"
+          $threadsEndpointUrl = "$($baseUrl)/threads$($apiVersion)"
+
+          # Check for existing comment
+          $response = Invoke-RestMethod -Headers $headers -Method GET -Uri $threadsEndpointUrl
+          $existingThread = $response.value | Where-Object { $_.comments | Where-Object { $_.content -and $_.content.startsWith("[//]: <> (terraform-plan-summary-comment: $($env:SYSTEM_DEFINITIONNAME))") } } | Select-Object -First 1
+          if($existingThread) {
+              Write-Host "Update existing comment"
+
+              $threadId = $existingThread.id
+              $commentId = $existingThread.comments[0].id
+              $body = @{
+                  content = $content
+              } | ConvertTo-Json
+
+              # update
+              $commentEndpointUrl = "$($baseUrl)/threads/$($threadId)/comments/$($commentId)$($apiVersion)"
+              Invoke-RestMethod -Headers $headers -Method PATCH -Uri $commentEndpointUrl -Body $body | Out-Null
+          } else {
+              Write-Host "Add new comment"
+              $body = @{
+                  comments = @(
+                      @{
+                      parentCommentId = 0
+                      content = $content
+                      commentType = 1
+                      }
+                  )
+                  status = 4
+              } | ConvertTo-Json
+
+              # create
+              Invoke-RestMethod -Headers $headers -Method POST -Uri $threadsEndpointUrl -Body $body | Out-Null
+          }
+        displayName: terraform summary
+        env:
+          SYSTEM_ACCESS_TOKEN: $(System.AccessToken)
