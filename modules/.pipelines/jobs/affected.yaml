@@ -1,0 +1,51 @@
+jobs:
+  - job: Affected
+    displayName: Affected
+    condition: always()
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      - name: sourceBranchName
+        value: $[ replace(variables['System.PullRequest.SourceBranch'], 'refs/heads/', '') ]
+      - name: targetBranchName
+        value: $[ replace(variables['System.PullRequest.TargetBranch'], 'refs/heads/', '') ]
+
+    steps:
+      - checkout: self
+        persistCredentials: true
+        fetchDepth: 0
+      - ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
+          - pwsh: |
+              git fetch origin $(sourceBranchName) | Out-Null
+              git fetch origin $(targetBranchName) | Out-Null
+
+              Write-Host "Source: $(sourceBranchName)"
+              Write-Host "Target: $(targetBranchName)"
+              $changes = git rev-list --right-only origin/$(sourceBranchName)..origin/$(targetBranchName)
+
+              if($changes.count -gt 0) {
+                throw "Source branch is behind master branch. Update the source branch."
+              } else {
+                Write-Host "Source branch is up to date with master!" 
+              }
+            displayName: Compare source branch to master
+      - template: ../steps/save-release-module.yaml
+      - pwsh: |
+          Import-Module "$(module)"
+
+          $modulesToRelease = Get-ModulesToRelease
+          $modulesToRelease.Keys | ForEach-Object {
+            Write-Host "Name: $($modulesToRelease[$_].ModuleName)"
+            Write-Host "Release Type: $($modulesToRelease[$_].ReleaseType)"
+            Write-Host "Release Version: $($modulesToRelease[$_].ReleaseVersion)"
+            Write-Host ""
+          }
+
+          if($modulesToRelease.Count) {
+            $json = $modulesToRelease | ConvertTo-Json -Compress
+            Write-Output "##vso[task.setvariable variable=JSON;isOutput=true]$json"
+          } else {
+            Write-Host "Nothing affected"
+          }
+        name: Modules
+        displayName: Get affected modules
