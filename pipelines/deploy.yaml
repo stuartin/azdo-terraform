@@ -148,7 +148,7 @@ stages:
 
   - ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
       - stage: summary
-        displayName: Plan Summary
+        displayName: Summary
         dependsOn:
           - ${{ if not(parameters.token.useEnvironmentToken) }}:
               - setup
