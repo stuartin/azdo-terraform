@@ -1,0 +1,76 @@
+jobs:
+  - job: TFTEST
+    timeoutInMinutes: 90
+    displayName: terraform test
+    dependsOn: []
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      matrix: $[ stageDependencies.Affected.Affected.outputs['Modules.JSON'] ]
+    steps:
+      - checkout: self
+        persistCredentials: true
+      - template: ../../terraform/templates/install-terraform.yaml
+        parameters:
+          terraformVersion: ${{ parameters.terraformVersion }}
+      - task: AzureCLI@2
+        displayName: terraform test
+        inputs:
+          azureSubscription: Az Service Connection
+          scriptType: "pscore"
+          scriptLocation: "inlineScript"
+          failOnStandardError: true
+          inlineScript: |
+            # We need to create a job that will refresh our token in the background
+            # while terraform test is running.
+            #
+            # By default the id token we get from az login is only valid for 10mins and the
+            # access token for 60mins, so for tests that run longer then that, they will fail.
+            # This occurs for things like mssql managed instance that take a along time
+            # to teardown by default (> 60mins)
+            #
+            # https://github.com/Azure/azure-cli/issues/28708
+
+            Start-Job -Name "refreshOidcTokenJob" -ScriptBlock {
+              do {
+                $serviceConnectionId = Get-ChildItem -Path Env: -Recurse -Include ENDPOINT_DATA_* | 
+                  Select-Object -First 1 -ExpandProperty Name | 
+                  ForEach-Object { $_.Split("_")[2] }
+
+                $oidcRequestUrl = "${env:SYSTEM_TEAMFOUNDATIONCOLLECTIONURI}${env:SYSTEM_TEAMPROJECTID}/_apis/distributedtask/hubs/build/plans/${env:SYSTEM_PLANID}/jobs/${env:SYSTEM_JOBID}/oidctoken?api-version=7.1-preview.1&serviceConnectionId=${serviceConnectionId}"
+                $headers = @{
+                  Authorization  = "Bearer $(System.AccessToken)"
+                  "Content-Type" = "application/json"
+                }
+                $oidcTokenResponse = Invoke-RestMethod -Headers $headers -Uri $oidcRequestUrl -Method Post
+                $oidcToken = $oidcTokenResponse.oidcToken
+
+                if (!$oidcToken) {
+                  Write-Warning "OIDC token could not be acquired. Retrying..."
+                  Start-Sleep -Seconds 30
+                  continue
+                }
+
+                $account = az account show -o json | ConvertFrom-Json
+                az login --service-principal --username $account.user.name --tenant $account.tenantId --allow-no-subscriptions --federated-token $oidcToken | Out-Null
+
+                $env:ARM_TENANT_ID = $account.tenantId
+                $env:ARM_SUBSCRIPTION_ID = $account.id
+                $env:ARM_CLIENT_ID = $account.user.name
+                $env:ARM_OIDC_TOKEN = $oidcToken
+
+                Start-Sleep -Duration (New-TimeSpan -Minutes 5)
+              } while ($true)
+            } | 
+              Tee-Object -Variable refreshOidcTokenJob | 
+              Select-Object -ExcludeProperty Command | 
+              Write-Host -ForegroundColor DarkMagenta
+
+            terraform -chdir="$(ModuleDirectory)" init
+            terraform -chdir="$(ModuleDirectory)" test
+
+            Receive-Job $refreshOidcTokenJob
+            Stop-Job -Job $refreshOidcTokenJob
+            Remove-Job -Job $refreshOidcTokenJob
+
+            
