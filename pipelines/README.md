@@ -1,10 +1,16 @@
 # Terraform
 
+**This is predominently designed to be ran against Hashicorp Terraform Cloud**
+
 This `deploy.yaml` template can be used to execute `terraform` plan and apply operations.
 It's designed so that a consumer pipeline can specify a dynamic list of environments where to deploy infrastructure.
 
 The first environment does not depend on anything, but all other environments must specify a `dependsOn` value.
 This controls the flow of pipeline stages during `terraform apply`.
+
+If the pipeline is trigger via a Pull Request, a summary of the changes will automatically be added as a comment.
+Subsequent plans will update the same comment.
+
 
 ## Parameters
 
