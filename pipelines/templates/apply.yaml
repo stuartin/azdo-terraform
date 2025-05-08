@@ -1,0 +1,70 @@
+parameters:
+  - name: azureDevOpsEnvironment
+    displayName: (Required) The Azure DevOps environment the deployment job will use
+    type: string
+
+  - name: terraformCloudToken
+    displayName: (Required) An API Token to authenticate with Terraform Cloud
+    type: string
+
+  - name: terraformWorkingDirectory
+    displayName: (Optional) The working directory terraform should run in
+    type: string
+    default: "/"
+
+  - name: terraformCommandOptions
+    displayName: (Optional) Any additional cli options to pass to Terraform
+    type: string
+    default: ""
+
+  - name: terraformVersion
+    displayName: (Optional) The terraform version to use
+    type: string
+    default: ""
+
+  - name: terraformEnvironmentVariables
+    displayName: (Optional) Any additional environment variables to set when terraform runs. Object must contain 'name' and 'value' keys.
+    type: object
+    default: []
+
+  - name: preSteps
+    displayName: (Optional) Any steps that should be ran before terraform runs
+    type: stepList
+    default: []
+
+  - name: postSteps
+    displayName: (Optional) Any steps that should be ran after terraform runs
+    type: stepList
+    default: []
+
+jobs:
+  - deployment: ApplyDeployment
+    displayName: Terraform Apply
+    environment: ${{ parameters.azureDevOpsEnvironment }}
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+
+            - ${{ parameters.preSteps }}
+
+            - template: install-init.yaml
+              parameters:
+                terraformCloudToken: ${{ parameters.terraformCloudToken }}
+                terraformWorkingDirectory: ${{ parameters.terraformWorkingDirectory }}
+                terraformVersion: ${{ parameters.terraformVersion }}
+                terraformEnvironmentVariables: ${{ parameters.terraformEnvironmentVariables }}
+
+            - pwsh: |
+                Write-Host "terraform -chdir=${{ parameters.terraformWorkingDirectory }} apply -auto-approve ${{ parameters.terraformCommandOptions }}"
+                terraform -chdir=${{ parameters.terraformWorkingDirectory }} apply -auto-approve ${{ parameters.terraformCommandOptions }}
+              displayName: terraform apply
+              env:
+                TF_TOKEN_app_terraform_io: ${{ parameters.terraformCloudToken }}
+                ${{ each variable in parameters.terraformEnvironmentVariables }}:
+                  ${{ variable.name }}: ${{ variable.value }}
+
+            - ${{ parameters.postSteps }}
