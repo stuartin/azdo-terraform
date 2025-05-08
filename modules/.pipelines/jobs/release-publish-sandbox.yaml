@@ -1,0 +1,46 @@
+# Sandbox release will:
+# - NOT generate a CHANGELOG.md
+# - NOT create git tags
+# - NOT commit to main
+# - WILL append a -rc.<buildId> to the release version
+# - WILL publish to sandbox account
+parameters:
+  - name: terraformCloudToken
+    displayName: (Required) The Terraform cloud token to use to publish a new module version
+    type: string
+    
+  - name: terraformCloudSandboxName
+    displayName: (Required) The terraform cloud sandbox organization account
+    type: string
+
+jobs:
+  - job: SandboxReleasePublish
+    displayName: Sandbox Release & Publish
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      affectedModulesJSON: $[ stageDependencies.Affected.Affected.outputs['Modules.JSON'] ]
+    steps:
+      - checkout: self
+        persistCredentials: true
+      - template: ../steps/install-terraform-docs.yaml
+      - template: ../steps/save-release-module.yaml
+      - pwsh: |
+          Import-Module "$(module)"
+
+          $modulesToRelease = '$(affectedModulesJSON)' | ConvertFrom-Json
+          $modulesToRelease.PSObject.Properties | ForEach-Object {
+            $moduleName = $_.Value.ModuleName
+            $moduleVersion = $_.Value.ModuleVersion
+            $moduleDirectory = $_.Value.ModuleDirectory
+            $releaseType = $_.Value.ReleaseType
+            $releaseVersion = $_.Value.ReleaseVersion
+
+            terraform-docs md doc --output-file README.md --output-mode inject "$moduleDirectory" --sort-by required | Out-Null
+            $tagName = New-Release -ModuleName $moduleName -ModuleVersion $moduleVersion -ModuleDirectory $moduleDirectory -ReleaseType $releaseType -ReleaseVersion $releaseVersion -DryRun $True
+            $sandboxTagName = "$tagName-rc.$(Build.BuildId)"
+
+            Write-Host "Publishing $sandboxTagName"
+            Add-ModuleToTerraformCloud -Token ${{ parameters.terraformCloudToken }} -Tag $sandboxTagName -ModuleDirectory $moduleDirectory -Organization ${{ parameters.terraformCloudSandboxName }}
+          }
+        displayName: release
