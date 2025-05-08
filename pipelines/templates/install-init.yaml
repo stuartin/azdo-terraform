@@ -1,0 +1,41 @@
+parameters:
+  - name: terraformCloudToken
+    displayName: (Required) An API Token to authenticate with Terraform Cloud
+    type: string
+
+  - name: terraformWorkingDirectory
+    displayName: (Optional) The working directory terraform should run in
+    type: string
+    default: "/"
+
+  - name: terraformVersion
+    displayName: (Optional) The terraform version to use
+    type: string
+    default: ""
+
+  - name: terraformEnvironmentVariables
+    displayName: (Optional) Any additional environment variables to set when terraform runs. Object must contain 'name' and 'value' keys.
+    type: object
+    default: []
+
+steps:
+  - pwsh: |
+      curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+      sudo apt-add-repository "deb [arch=$(dpkg --print-architecture)] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+      sudo apt update
+      if ([string]::IsNullOrEmpty('${{ parameters.terraformVersion }}')) {
+        sudo apt install terraform
+      } else {
+        sudo apt install terraform=${{ parameters.terraformVersion }}-*
+      }
+    displayName: terraform install
+  - pwsh: |
+      terraform -v
+      
+      Write-Host "terraform -chdir=${{ parameters.terraformWorkingDirectory }} init"
+      terraform -chdir=${{ parameters.terraformWorkingDirectory }} init
+    displayName: terraform init
+    env:
+      TF_TOKEN_app_terraform_io: ${{ parameters.terraformCloudToken }}
+      ${{ each variable in parameters.terraformEnvironmentVariables }}:
+        ${{ variable.name }}: ${{ variable.value }}
