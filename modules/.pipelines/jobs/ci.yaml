@@ -1,0 +1,41 @@
+jobs:
+  - job: FMT_TFLINT_TFSEC
+    displayName: fmt, tflint, tfsec
+    dependsOn: []
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      matrix: $[ stageDependencies.Affected.Affected.outputs['Modules.JSON'] ]
+    steps:
+      - pwsh: |
+          # tflint
+          curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+
+          # trivy
+          wget https://github.com/aquasecurity/trivy/releases/download/v0.57.1/trivy_0.57.1_Linux-64bit.deb
+          sudo dpkg -i trivy_0.57.1_Linux-64bit.deb
+        displayName: setup
+      - template: ../../terraform/templates/install-terraform.yaml
+        parameters:
+          terraformVersion: ${{ parameters.terraformVersion }}
+      - pwsh: |
+          terraform -chdir="$(ModuleDirectory)" fmt -check
+
+          if($LastExitCode -ne 0) {
+            throw "The above file(s) in your module have not been formatted. Please run terraform fmt to format your code."
+          }
+        displayName: fmt -check
+      - pwsh: |
+          $parentFolder = (Get-Item -Path "$(ModuleDirectory)").Parent.FullName
+          $configFile = Join-Path -Path $parentFolder -ChildPath ".config/.tflint.hcl"
+
+          tflint --config $configFile --init
+          tflint --config $configFile --chdir="$(ModuleDirectory)"
+        displayName: tflint
+      - pwsh: |
+          $parentFolder = (Get-Item -Path "$(ModuleDirectory)").Parent.FullName
+          $configFile = Join-Path -Path $parentFolder -ChildPath ".config/trivy.yaml"
+          $ignoreFile = Join-Path -Path $parentFolder -ChildPath ".config/.trivyignore.yaml"
+
+          trivy --config $configFile --ignorefile $ignoreFile config --skip-files "$(ModuleDirectory)/examples/**/*.tf" "$(ModuleDirectory)"
+        displayName: trivy (tfsec)
