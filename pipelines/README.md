@@ -82,8 +82,7 @@ When each region/environment configuration is managed via a `.tfvars` variables 
     ├── env
     |    ├── dev.tfvars
     |    ├── stg.tfvars
-    |    ├── prd.tfvars
-    |    └── pr.tfvars
+    |    └── prd.tfvars
     └── main.tf
 ```
 
