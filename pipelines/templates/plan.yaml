@@ -1,0 +1,85 @@
+parameters:
+  - name: terraformCloudToken
+    displayName: (Required) An API Token to authenticate with Terraform Cloud
+    type: string
+
+  - name: terraformWorkingDirectory
+    displayName: (Optional) The working directory terraform should run in
+    type: string
+    default: "/"
+
+  - name: terraformCommandOptions
+    displayName: (Optional) Any additional cli options to pass to Terraform
+    type: string
+    default: ""
+
+  - name: terraformVersion
+    displayName: The terraform version to use
+    type: string
+    default: ""
+
+  - name: terraformEnvironmentVariables
+    displayName: (Optional) Any additional environment variables to set when terraform runs. Object must contain 'name' and 'value' keys.
+    type: object
+    default: []
+
+  - name: preSteps
+    displayName: (Optional) Any steps that should be ran before terraform runs
+    type: stepList
+    default: []
+
+  - name: postSteps
+    displayName: (Optional) Any steps that should be ran after terraform runs
+    type: stepList
+    default: []
+
+jobs:
+  - job: PlanJob
+    displayName: Terraform Plan
+    condition: always()
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+      - ${{ parameters.preSteps }}
+
+      - template: install-init.yaml
+        parameters:
+          terraformCloudToken: ${{ parameters.terraformCloudToken}}
+          terraformWorkingDirectory: ${{ parameters.terraformWorkingDirectory}}
+          terraformVersion: ${{ parameters.terraformVersion}}
+          terraformEnvironmentVariables: ${{ parameters.terraformEnvironmentVariables }}
+
+      - pwsh: |
+          Write-Host "terraform -chdir=${{ parameters.terraformWorkingDirectory }} plan -detailed-exitcode ${{ parameters.terraformCommandOptions }}"
+          terraform -chdir=${{ parameters.terraformWorkingDirectory }} plan -detailed-exitcode ${{ parameters.terraformCommandOptions }} | Tee-Object -Variable consolePlan
+
+          # Use the exit code to set a output variable to indicate if the plan has changes
+          if($LastExitCode -eq 2) {
+            # Success, Has Changes
+            Write-Output "##vso[task.setvariable variable=HasChanges;isOutput=true]true"
+
+            # Get plan url from console output
+            # stdout includes ANSI codes (usually for color and escape codes)
+            # we need to remove these characters from the rawUrl before saving the runUrl
+            $runUrl = $consolePlan -replace '\x1B\[[0-?9;]*[mK]', '' | Select-String -Pattern '^https://app.terraform.io/app/(org)/.+$'
+            Write-Output "##vso[task.setvariable variable=RunUrl;isOutput=true]$runUrl"
+
+            exit 0
+          } elseif($LastExitCode -eq 1) {
+            # Error
+            exit 1
+            
+          } else {
+            # Success, No Changes
+            Write-Output "##vso[task.setvariable variable=HasChanges;isOutput=true]false"
+            exit 0
+          }
+        name: PlanStep
+        displayName: terraform plan
+        env:
+          TF_TOKEN_app_terraform_io: ${{ parameters.terraformCloudToken }}
+          ${{ each variable in parameters.terraformEnvironmentVariables }}:
+            ${{ variable.name }}: ${{ variable.value }}
+
+      - ${{ parameters.postSteps }}
