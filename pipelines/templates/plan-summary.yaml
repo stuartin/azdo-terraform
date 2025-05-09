@@ -10,7 +10,7 @@ parameters:
     displayName: |
       (Required) A list of environments to check
 
-      - name:       <string>   - (Required) The name of the environment. Usually dv, sy, st, pr, mg.
+      - name:       <string>   - (Required) The name of the environment. Usually dev, stg, prd
         hasChanges: <string>   - (Required) Whether the environment has changes to apply
         runUrl:     <string>   - (Required) The Terraform Cloud run url
         token:      <string>   - (Required) A Terraform Cloud token to use when getting the run details
