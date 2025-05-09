@@ -1,8 +1,8 @@
 parameters:
   - name: applyBranch
     type: string
-    default: refs/heads/master
-    displayName: (Optional) The trunk branch where terraform apply stages are allowed. Defaults to refs/heads/master.
+    default: refs/heads/main
+    displayName: (Optional) The trunk branch where terraform apply stages are allowed. Defaults to refs/heads/main.
 
   - name: token
     type: object
@@ -20,7 +20,7 @@ parameters:
     displayName: |
       (Required) A list of environments to deploy.
 
-      - name:                          <string>   - (Required) The name of the environment. Usually dv, sy, st, pr, mg.
+      - name:                          <string>   - (Required) The name of the environment. Usually dev, stg, prd.
         azureDevOpsEnvironment:        <string>   - (Required) The name of the Azure DevOps environment to deploy in to.
         dependsOn:                     <string>   - (Optional) The name of any environment that should run before this one.
         terraformWorkingDirectory:     <string>   - (Optional) The working directory to execute terraform from. Defaults to repository root.
