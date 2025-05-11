@@ -1,0 +1,468 @@
+# Why is this here?
+#
+# We wish it didnt have to be, but unfortunately we cannot execute or
+# access files outside of templates when we use a resource.repository
+# definition.
+# To work around this and not have to worry about download files through
+# azdo apis or perform additional checkout logic. We just define the module
+# inside this step.
+# If you need to make changes, feel free to move it outside the step to
+# a dedicated .psm1 file and import it locally when testing.
+
+steps:
+  - pwsh: |
+        $module = @'
+        
+            function Get-SemanticRules {
+                return @(
+                    @{
+                        Type     = "major"
+                        Priority = 0
+                        Prefixes = @('fix!', 'docs!', 'feat!' )
+                        Keywords = @('BREAKING CHANGE', 'BREAKING CHANGES')
+                    },
+                    @{
+                        Type     = "minor"
+                        Priority = 1
+                        Prefixes = @('feat')
+                        Keywords = @()
+                    },
+                    @{
+                        Type     = "patch"
+                        Priority = 2
+                        Prefixes = @('fix', 'docs')
+                        Keywords = @()
+                    }
+                )
+            }
+
+            function Get-Modules {
+                [CmdletBinding()]
+                param (
+                    [Parameter(HelpMessage = 'The parent directory to search for modules')]
+                    [ValidateNotNull()]
+                    $ParentDirectory = "modules",
+
+                    [Parameter(HelpMessage = 'Whether to prefix the parent folder to the name of the module')]
+                    [ValidateNotNull()]
+                    $PrefixParentFolderToName = $True
+                )
+
+                $modules = Get-ChildItem -Path $ParentDirectory -Recurse -Filter "package.json" | ForEach-Object {
+                    $package = $_ | Get-Content -Raw | ConvertFrom-JSON
+                    $moduleName = $package.Name
+                    if ($PrefixParentFolderToName) {
+                        $moduleName = "$($_.Directory.Parent.Name)/$($package.name)"
+                    }
+
+                    [PSCustomObject]@{
+                        Name      = $moduleName
+                        Version   = $package.Version
+                        Directory = $_.Directory.FullName
+                    }
+                }
+
+                return $modules
+            }
+
+            function Get-ReleaseTypeFromCommitMessages {
+                [CmdletBinding()]
+                param (
+                    [Parameter(Mandatory, HelpMessage = 'The commit message to determine the semantic type from')]
+                    [ValidateNotNull()]
+                    $CommitMessages
+                )
+
+                $semanticRules = Get-SemanticRules
+                $ReleaseTypes = @()
+
+                foreach ($commitMessage in $CommitMessages) {
+                    $commitReleaseType = $Null
+                    foreach ($rule in $semanticRules) {
+                        # Ignore the automatic commit prefix added to a squash merge "Merged PR NNN: "
+                        $cleanCommitMessage = $CommitMessage -replace 'Merged PR \d+: ', ''
+
+                        # Check if $cleanCommitMessage starts with conventional commit prefixes
+                        # or if $CommitMessage contains conventional commit keywords
+                        $hasPrefix = $rule.Prefixes | ForEach-Object { $prefix = $_; $cleanCommitMessage -imatch "^$prefix" }
+                        $hasKeyword = $rule.Keywords | ForEach-Object { $keyword = $_; $CommitMessage -ilike "*$keyword*" }
+
+                        if ($hasPrefix -eq $True -or $hasKeyword -eq $True) {
+                            $commitReleaseType = $rule
+                            break
+                        }
+                    }
+
+                    if ($commitReleaseType) {
+                        $ReleaseTypes += $commitReleaseType
+                    }
+                }
+
+                return ($ReleaseTypes | Sort-Object -Property Priority | Select-Object -First 1).Type
+            }
+
+            function Get-NewSemanticVersionFromType {
+                [CmdletBinding()]
+                param (
+                    [Parameter(Mandatory, HelpMessage = 'The current version to increment from')]
+                    $CurrentVersion,
+
+                    [Parameter(Mandatory, HelpMessage = 'The semantic type to bump the current version by')]
+                    [ValidateSet('major', 'minor', 'patch')]
+                    $ReleaseType
+                )
+
+                $defaultVersion = "0.0.1"
+
+                if (-not $CurrentVersion) {
+                    return $defaultVersion
+                }
+
+                [int]$majorNum, [int]$minorNum, [int]$patchNum = $CurrentVersion.split('.')
+
+                if ($ReleaseType -eq 'major') {
+                    $majorNum++
+                    $minorNum = 0
+                    $patchNum = 0
+                }
+
+                if ($ReleaseType -eq 'minor') {
+                    $minorNum++
+                    $patchNum = 0
+                }
+
+                if ($ReleaseType -eq 'patch') {
+                    $patchNum++
+                }
+
+                return "$majorNum.$minorNum.$patchNum"
+            }
+
+            function Get-ModuleCommits {
+                [CmdletBinding()]
+                param (
+                    [Parameter(Mandatory, HelpMessage = 'The module name')]
+                    [ValidateNotNull()]
+                    $ModuleName,
+
+                    [Parameter(Mandatory, HelpMessage = 'The module version')]
+                    [ValidateNotNull()]
+                    $ModuleVersion,
+
+                    [Parameter(Mandatory, HelpMessage = 'The module directory')]
+                    [ValidateNotNull()]
+                    $ModuleDirectory
+                )
+
+                $lastTag = (git tag -l --sort=-v:refname) | Where-Object { $_ -like "$ModuleName@*" } | Select-Object -First 1
+
+                $commitRange = if ($lastTag) { "$lastTag..HEAD" } else { "HEAD" }
+                $commits = (git log --format="%H|%s" --name-only $commitRange) | ForEach-Object {
+                    if ($_ -match '^([0-9a-f]{40})\|(.*)$') {
+                        $commitHash = $matches[1]
+                        $commitMessage = $matches[2]
+                
+                        # Retrieve files changed in the commit
+                        # And check if the changed files were in the module directory
+                        $filesChanged = git show --pretty="format:" --name-only --oneline $commitHash | Select-Object -Skip 1
+                        $filesChangedRelatedToModule = ($filesChanged | ForEach-Object { 
+                                # We test the path because filesChanged may include commits that have deleted files
+                                if (Test-Path -Path $_) {
+                                    $moduleRoot = Get-Item -Path $ModuleDirectory
+                                    $file = Get-Item -Path $_ -ErrorAction SilentlyContinue
+                                    
+                                    # Trigger a release whenever:
+                                    # - Changed file exists
+                                    # - Changed file is NOT a .tftest.hcl
+                                    # - Changed file is in module folder
+                                    #   - Changed file ends in .tf
+                                    #   - Changed file is in <module-directory>/examples and ends in .md
+                                    $file -ne $Null -and
+                                    !$file.FullName.EndsWith(".tftest.hcl") -and
+                                    $file.FullName.StartsWith($moduleRoot.FullName) -and
+                                    (
+                                        $file.FullName -like "$($moduleRoot.FullName)/*.tf" -or
+                                        (
+                                            $file.FullName.StartsWith("$($moduleRoot.FullName)/examples") -and 
+                                            $file.FullName.EndsWith(".md")
+                                        )
+                                    )
+                                }
+                            }) -contains $True
+
+                        if ($filesChangedRelatedToModule) {
+                            # If the commit follows conventional commits and
+                            # there is a release type, return it
+                            $releaseType = Get-ReleaseTypeFromCommitMessages -CommitMessages @($commitMessage)
+                            if ($releaseType -ne '') {
+                                [PSCustomObject]@{
+                                    ModuleName      = $ModuleName
+                                    ModuleVersion   = $ModuleVersion
+                                    ModuleDirectory = $ModuleDirectory
+                                    ShortSHA        = $commitHash.Substring(0, 7)
+                                    LongSHA         = $commitHash
+                                    Message         = $commitMessage
+                                    FilesChanged    = $filesChanged
+                                    ReleaseType     = $releaseType
+                                }
+                            }
+
+                        }
+                    }
+                }
+
+                return $commits
+            }
+
+            function Get-ModulesToRelease {
+                $modules = Get-Modules
+
+                $modulesToRelease = @{}
+                $modules | ForEach-Object {
+                    $module = $_
+
+                    $commits = Get-ModuleCommits -ModuleName $module.Name -ModuleVersion $module.Version -ModuleDirectory $module.Directory
+                    if ($commits.Length -gt 0) {
+                        $commitMessages = $commits | ForEach-Object { $_.Message }
+                        $releaseType = Get-ReleaseTypeFromCommitMessages -CommitMessages $commitMessages
+                        
+                        if ($releaseType) { 
+                            $modulesToRelease[$module.Name] = [PSCustomObject]@{
+                                ModuleName      = $module.Name
+                                ModuleVersion   = $module.Version
+                                ModuleDirectory = $module.Directory
+                                ReleaseType     = $releaseType
+                                ReleaseVersion  = Get-NewSemanticVersionFromType -CurrentVersion $module.Version -ReleaseType $releaseType
+                            }
+                        }
+                    }
+                }
+                $modulesToRelease
+            }
+
+            function Get-ChangelogHeader {
+                [CmdletBinding()]
+                param (
+                    [Parameter(Mandatory, HelpMessage = 'The name of the module to append to the header')]
+                    [ValidateNotNull()]
+                    $ModuleName
+                )
+
+                @(
+                    "# Changelog - $ModuleName",
+                    "",
+                    "All notable changes to this project will be documented in this file. See [conventional-commits](https://www.conventionalcommits.org/) for commit guidelines.",
+                    ""
+                )
+            }
+
+            function Get-UpdatedChangelog {
+                [CmdletBinding()]
+                param (
+                    [Parameter(Mandatory, HelpMessage = 'The path to the CHANGELOG.md file')]
+                    [ValidateNotNull()]
+                    $ChangeLogPath,
+
+                    [Parameter(Mandatory, HelpMessage = 'The module name')]
+                    [ValidateNotNull()]
+                    $ModuleName,
+
+                    [Parameter(Mandatory, HelpMessage = 'The module directory')]
+                    [ValidateNotNull()]
+                    $ModuleDirectory,
+
+                    [Parameter(Mandatory, HelpMessage = 'The release version to use')]
+                    [ValidateNotNull()]
+                    $ReleaseVersion,
+
+                    [Parameter(Mandatory, HelpMessage = 'The commits relating to the module')]
+                    [ValidateNotNull()]
+                    $Commits
+                )
+
+                # New changelog entry
+                $changelogDetails = @(
+                    "## $ReleaseVersion ($(Get-Date -Format "yyyy-MM-dd"))",
+                    ""
+                )
+
+                $Commits | Group-Object -Property ReleaseType | Where-Object { $_.Name -ne "" } | ForEach-Object {
+                    # Add the release type
+                    $releaseTypeHeader = $_.Name
+                    $changelogDetails += "### $releaseTypeHeader"
+                    $changelogDetails += ""
+
+                    # Add each commit message
+                    $_.Group | ForEach-Object { 
+                        $changelogDetails += "- $($_.Message)"
+                    }
+                }
+
+                # Prepare final changelog
+                $changeLogHeader = Get-ChangelogHeader -ModuleName $ModuleName
+                $changelogContent = Get-Content -Path $ChangeLogPath -ErrorAction SilentlyContinue
+                $existingChangelogDetails = $Null
+                if ($changeLogContent) {
+                    $existingChangelogDetails = $changelogContent[($changeLogHeader.Length - 1)..($changelogContent.Length - 1)]
+                }
+
+                return @(
+                    $changeLogHeader,
+                    $changelogDetails,
+                    $existingChangelogDetails
+                )
+            }
+
+            function New-Release {
+                [CmdletBinding()]
+                param (
+                    [Parameter(Mandatory, HelpMessage = 'The module name')]
+                    [ValidateNotNull()]
+                    $ModuleName,
+
+                    [Parameter(Mandatory, HelpMessage = 'The current module version')]
+                    [ValidateNotNull()]
+                    $ModuleVersion,
+
+                    [Parameter(Mandatory, HelpMessage = 'The module directory')]
+                    [ValidateNotNull()]
+                    $ModuleDirectory,
+
+                    [Parameter(Mandatory, HelpMessage = 'The release type to create')]
+                    [ValidateNotNull()]
+                    $ReleaseType,
+
+                    [Parameter(Mandatory, HelpMessage = 'The release version to use')]
+                    [ValidateNotNull()]
+                    $ReleaseVersion,
+
+                    [Parameter(HelpMessage = 'Perform a dry run. Dont make changes')]
+                    [ValidateNotNull()]
+                    $DryRun = $True
+                )
+
+                $tag = "$ModuleName@$ReleaseVersion"
+                Write-Host "Release: $tag"
+                Write-Host ""
+
+                # Update changelog
+                $changelogPath = "$ModuleDirectory/CHANGELOG.md"
+                $commits = Get-ModuleCommits -ModuleName $ModuleName -ModuleVersion $ModuleVersion -ModuleDirectory $ModuleDirectory
+                $updatedChangelog = Get-UpdatedChangelog -ChangeLogPath $changelogPath -ModuleName $ModuleName -ModuleDirectory $ModuleDirectory -ReleaseVersion $ReleaseVersion -Commits $commits
+                if (-not $DryRun) {
+                    Remove-Item -Path $changelogPath -Force -ErrorAction SilentlyContinue
+                    $updatedChangelog | ForEach-Object { $_ | Out-File -FilePath $changelogPath -Append }
+                }
+                else {
+                    Write-Host ($updatedChangelog | Format-Table | Out-String)
+                    Write-Host ""
+                }
+
+                # Update package.json
+                $packageJSONPath = "$ModuleDirectory/package.json"
+                $package = Get-Content -Path $packageJSONPath | ConvertFrom-Json
+                $package.version = $ReleaseVersion
+                if (-not $DryRun) {
+                    $package | ConvertTo-Json | Out-File -FilePath $packageJSONPath
+                }
+
+                return $tag
+            }
+
+            function Add-ModuleToTerraformCloud {
+                [CmdletBinding()]
+                param (
+                    [Parameter(Mandatory, HelpMessage = 'The token to use to authenticate with Terraform Cloud')]
+                    [ValidateNotNull()]
+                    $Token,
+
+                    [Parameter(Mandatory, HelpMessage = 'The Terraform Cloud organization')]
+                    [ValidatePattern('^([a-zA-Z]+)/([a-zA-Z-_]+)@([0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?)$')] # <provider>/<name>@<version> | <provider>/<name>@<version>-rc.<increment>
+                    $Tag,
+
+                    [Parameter(Mandatory, HelpMessage = 'The module directory that relates to the specific tag/module to add')]
+                    [ValidateNotNull()]
+                    $ModuleDirectory,
+
+                    [Parameter(Mandatory, HelpMessage = 'The Terraform Cloud organization')]
+                    [ValidateNotNull()]
+                    $Organization
+
+                )
+
+                $tagExists = git tag -l $Tag
+                if ($tagExists) { $tagSHA = git rev-list -n 1 $Tag } else { $tagSHA = git rev-list -n 1 'HEAD' }
+
+                $module, $moduleVersion = $Tag.split('@')
+                $moduleProvider, $moduleName = $module.split('/')
+
+                # Setup config for Terraform Cloud API
+                $baseUrl = "https://app.terraform.io/api/v2/organizations/$Organization"
+                $moduleEndpoint = "$baseUrl/registry-modules"
+                $headers = @{
+                    Authorization  = "Bearer $Token"
+                    'Content-Type' = "application/vnd.api+json"
+                }
+
+                # Ensure there is a module identifier in the registry
+                $query = "?filter[provider]=$moduleProvider&q=$moduleName"
+                $moduleUrl = "$moduleEndpoint$query"
+                Write-Host "Checking module existence at URL: $moduleUrl"
+
+                $moduleResponse = Invoke-RestMethod -Headers $headers -Method GET -Uri $moduleUrl
+                $module = $moduleResponse.data | Where-Object { $_.attributes.name -eq $moduleName }
+
+
+                if (-not $module) {
+                    Write-Host "Module not found, creating a new module."
+                    $body = @{
+                        data = @{
+                            type       = "registry-modules"
+                            attributes = @{
+                                provider        = $moduleProvider
+                                name            = $moduleName
+                                'registry-name' = 'private'
+                                'no-code'       = $False
+                            }
+                        }
+                    } | ConvertTo-Json -Compress
+
+                    $newModuleResponse = Invoke-RestMethod -Headers $headers -Method POST -Uri $moduleEndpoint -Body $body
+                    $module = $newModuleResponse.data
+                    Write-Host "Module created: $($module.id)"
+                }
+                else {
+                    Write-Host "Module found: $($module.id)"
+                }
+
+                # Add a module version
+                $registryName = $module.attributes.'registry-name'
+                $namespace = $module.attributes.namespace
+                $versionEndpoint = "$moduleEndpoint/$registryName/$namespace/$moduleName/$moduleProvider/versions"
+
+                $body = @{
+                    data = @{
+                        type       = "registry-module-versions"
+                        attributes = @{
+                            version      = $moduleVersion
+                            'commit-sha' = $tagSHA
+                        }
+                    }
+                } | ConvertTo-Json -Compress
+
+                $newVersion = Invoke-RestMethod -Headers $headers -Method POST -Uri $versionEndpoint -Body $body
+
+                # Upload module
+                $uploadUrl = $newVersion.data.links.upload
+                $moduleTar = Join-Path -Path "$(Agent.TempDirectory)" -ChildPath upload.tgz
+                tar --exclude upload.tgz -cvzf $moduleTar -C $ModuleDirectory .
+
+                Invoke-RestMethod -Headers $headers -Method PUT -Uri $uploadUrl -InFile $moduleTar
+            }
+
+        '@
+
+        $path = "$(Agent.TempDirectory)/ReleaseTerraformModules.psm1"
+        Out-File -InputObject $module -FilePath $path -Force
+        Write-Output "##vso[task.setvariable variable=module]$path"
+    displayName: Save release script

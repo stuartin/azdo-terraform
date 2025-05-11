@@ -1,0 +1,32 @@
+parameters:
+  - name: terraformCloudToken
+    displayName: (Required) The Terraform cloud token to use to publish a new module version
+    type: string
+
+  - name: terraformCloudOrganization
+    displayName: (Required) The Terraform cloud organization to publish to
+    type: string
+
+jobs:
+  - job: Publish
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      tagName: $[replace(variables['Build.SourceBranch'],'refs/tags/','')]
+    steps:
+      - template: ../steps/save-release-module.yaml
+      - pwsh: |
+          Write-Host "Publish: $(tagName)"
+
+          Import-Module "$(module)"
+          $moduleName, $moduleVersion = "$(tagName)".split('@')
+          $modules = Get-Modules
+          $module = Get-Modules | Where-Object { $_.Name -eq "$moduleName" -and $_.Version -eq "$moduleVersion" }
+
+          if(-not $module) {
+            Write-Host ($modules | Format-Table | Out-String)
+            Write-Error "Could not find a module matching the tag $(tagName)"
+          }
+
+          Add-ModuleToTerraformCloud -Token ${{ parameters.terraformCloudToken }} -Tag $(tagName) -ModuleDirectory $module.Directory -Organization ${{ parameters.terraformCloudOrganization }}
+        displayName: publish

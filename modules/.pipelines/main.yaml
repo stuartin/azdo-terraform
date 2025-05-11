@@ -1,0 +1,78 @@
+parameters:
+  - name: terraformCloudSandboxToken
+    displayName: (Required) The owners token used to publish to sandbox
+    type: string
+
+  - name: terraformCloudProductionToken
+    displayName: (Required) The owners token used to publish to production
+    type: string
+
+stages:
+  - stage: Affected
+    displayName: Affected
+    condition: ne(variables.tag, 'true')
+    jobs:
+      - template: jobs/affected.yaml
+
+  - stage: CI
+    displayName: CI
+    dependsOn: Affected
+    condition: |
+      and(
+        succeeded(),
+        ne(variables.trunkBranch, 'true'),
+        ne(stageDependencies.Affected.outputs['Affected.Modules.JSON'], '')
+      )
+    jobs:
+      - template: jobs/ci.yaml
+      - template: jobs/tests.yaml
+
+  - stage: ProductionRelease
+    displayName: Production Release
+    dependsOn:
+      - CI
+      - Affected
+    condition: |
+      and(
+        eq(variables.trunkBranch, 'true'),
+        not(or(failed(), canceled())),
+        ne(stageDependencies.Affected.outputs['Affected.Modules.JSON'], '')
+      )
+    jobs:
+      - template: jobs/release.yaml
+
+  - stage: SandboxReleasePublish
+    displayName: Sandbox Release & Publish
+    dependsOn:
+      - CI
+      - Affected
+    condition: |
+      and(
+        eq(variables['Build.Reason'], 'PullRequest'),
+        not(or(failed(), canceled())),
+        ne(stageDependencies.Affected.outputs['Affected.Modules.JSON'], '')
+      )
+    jobs:
+      - template: jobs/release-publish-sandbox.yaml
+        parameters:
+          terraformCloudToken: ${{ parameters.terraformCloudSandboxToken }}
+
+  - stage: ProductionPublish
+    displayName: Production Publish
+    dependsOn: []
+    condition: eq(variables.tag, 'true')
+    jobs:
+      - template: jobs/publish.yaml
+        parameters:
+          terraformCloudToken: ${{ parameters.terraformCloudProductionToken }}
+          terraformCloudOrganization: prd
+
+  - stage: SandboxPublish
+    displayName: Sandbox Publish
+    dependsOn: []
+    condition: eq(variables.tag, 'true')
+    jobs:
+      - template: jobs/publish.yaml
+        parameters:
+          terraformCloudToken: ${{ parameters.terraformCloudSandboxToken }}
+          terraformCloudOrganization: sbx

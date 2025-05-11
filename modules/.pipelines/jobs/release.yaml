@@ -1,0 +1,48 @@
+jobs:
+  - deployment: ProductionRelease
+    displayName: Production Release
+    environment: modules
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      affectedModulesJSON: $[ stageDependencies.Affected.Affected.outputs['Modules.JSON'] ]
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+              persistCredentials: true
+            - template: ../steps/install-terraform-docs.yaml
+            - pwsh: |
+                git config user.name "azure-pipelines[bot]"
+                git config user.email "azure-pipelines@bot.com"
+              displayName: setup
+            - template: ../steps/save-release-module.yaml
+            - pwsh: |
+                Import-Module "$(module)"
+
+                Write-Host '$(affectedModulesJSON)'
+                $modulesToRelease = '$(affectedModulesJSON)' | ConvertFrom-Json
+                $tags = $modulesToRelease.PSObject.Properties | ForEach-Object {
+                  $moduleName = $_.Value.ModuleName
+                  $moduleVersion = $_.Value.ModuleVersion
+                  $moduleDirectory = $_.Value.ModuleDirectory
+                  $releaseType = $_.Value.ReleaseType
+                  $releaseVersion = $_.Value.ReleaseVersion
+
+                  terraform-docs md doc --output-file README.md --output-mode inject "$moduleDirectory" --sort-by required | Out-Null
+                  $tagName = New-Release -ModuleName $moduleName -ModuleVersion $moduleVersion -ModuleDirectory $moduleDirectory -ReleaseType $releaseType -ReleaseVersion $releaseVersion -DryRun $False
+                  git add "$moduleDirectory/package.json" "$moduleDirectory/README.md" "$moduleDirectory/CHANGELOG.md" | Out-Null
+
+                  return $tagName
+                }
+
+                git commit -m "chore(release): new module versions"
+
+                $lastCommit = git rev-parse HEAD
+                $tags | ForEach-Object {
+                  git tag -a $_ $lastCommit -m $_
+                }
+
+                git push --follow-tags origin HEAD:master
+              displayName: release
